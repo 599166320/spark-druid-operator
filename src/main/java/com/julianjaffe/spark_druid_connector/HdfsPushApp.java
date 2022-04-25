@@ -1,11 +1,13 @@
 package com.julianjaffe.spark_druid_connector;
-
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.InjectableValues;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Function;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.Closer;
+import com.julianjaffe.spark_druid_connector.clients.DruidMetadataClient;
 import com.julianjaffe.spark_druid_connector.configuration.Configuration;
 import com.julianjaffe.spark_druid_connector.configuration.DruidConfigurationKeys;
 import com.julianjaffe.spark_druid_connector.configuration.DruidDataWriterConfig;
@@ -21,7 +23,10 @@ import org.apache.druid.jackson.DefaultObjectMapper;
 import org.apache.druid.java.util.common.DateTimes;
 import org.apache.druid.java.util.common.FileUtils;
 import org.apache.druid.java.util.common.Intervals;
+import org.apache.druid.java.util.common.StringUtils;
 import org.apache.druid.java.util.common.parsers.TimestampParser;
+import org.apache.druid.math.expr.ExprMacroTable;
+import org.apache.druid.query.expression.*;
 import org.apache.druid.segment.*;
 import org.apache.druid.segment.column.ValueType;
 import org.apache.druid.segment.data.CompressionFactory;
@@ -35,28 +40,26 @@ import org.apache.druid.segment.indexing.DataSchema;
 import org.apache.druid.segment.loading.DataSegmentPusher;
 import org.apache.druid.segment.writeout.OnHeapMemorySegmentWriteOutMediumFactory;
 import org.apache.druid.timeline.DataSegment;
+import org.apache.druid.timeline.partition.NoneShardSpec;
 import org.apache.druid.timeline.partition.ShardSpec;
-import org.apache.spark.sql.sources.v2.DataSourceOptions;
+import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.spark.sql.sources.v2.writer.WriterCommitMessage;
+import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.joda.time.DateTime;
-import org.joda.time.Interval;
-import scala.Immutable;
-import scala.Int;
-import scala.Option;
+import org.joda.time.Interval;import scala.Option;
 import scala.Tuple2;
 import scala.collection.JavaConverters;
-import scala.collection.Seq;
 import scala.collection.mutable.ArrayBuffer;
 
-import java.io.Closeable;
-import java.io.File;
-import java.io.IOException;
+import java.io.*;
 import java.util.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class HdfsPushApp {
+
+
     static DataSchema dataSchema = null;
     static DruidDataWriterConfig config = null;
     private final static File tmpPersistDir = FileUtils.createTempDir("persist");
@@ -69,21 +72,79 @@ public class HdfsPushApp {
     private  final static IndexSpec indexSpec;
     private  final static DataSegmentPusher pusher;
     private final static Map<Long,Tuple2<List<IndexableAdapter>, List<IncrementalIndex>>> bucketToIndexMap = new HashMap<>();
-
+    private final static int maxColumnsToMerge = 1000;
+    private final static String ip = "192.168.3.52";
+    //private final static  String ip = "192.168.231.233";
     static {
 
-        scala.collection.immutable.Map<String,String> properties = new scala.collection.immutable.HashMap<>();
-        properties.$plus(new Tuple2<>("",""));
-        scala.collection.JavaConverters.mapAsScalaMap(ImmutableMap.of());
+        InjectableValues.Std  baseInjectableValues  =
+                new InjectableValues.Std()
+                        .addValue(ExprMacroTable.class, new ExprMacroTable(Arrays.asList(
+                                new LikeExprMacro(),
+                                new RegexpExtractExprMacro(),
+                                new TimestampCeilExprMacro(),
+                                new TimestampExtractExprMacro(),
+                                new TimestampFormatExprMacro(),
+                                new TimestampParseExprMacro(),
+                                new TimestampShiftExprMacro(),
+                                new TimestampFloorExprMacro(),
+                                new TrimExprMacro.BothTrimExprMacro(),
+                                new TrimExprMacro.LeftTrimExprMacro(),
+                                new TrimExprMacro.RightTrimExprMacro())))
+                        .addValue(ObjectMapper.class, MAPPER)
+                        .addValue(DataSegment.PruneSpecsHolder.class, DataSegment.PruneSpecsHolder.DEFAULT);
 
-        Configuration conf = new Configuration(properties);
+        MAPPER.setInjectableValues(baseInjectableValues);
+
+
+        Map<String,String> properties = new HashMap<>();
+        properties.put("table","bb05");
+        properties.put("writer.timestampColumn","__time");
+        properties.put("writer.version","1");
+        properties.put("writer.deepStorageType","hdfs");
+        properties.put("writer.storageDirectory","hdfs://druid-hadoop-demo:9000/druid/segments/");
+
+        properties.put("metadata.dbType" , "mysql");
+        properties.put( "metadata.connectUri" , "jdbc:mysql://"+ip+":3306/druid?allowPublicKeyRetrieval=true");
+        properties.put("metadata.user" , "druid");
+        //properties.put("metadata.password" , "8u7666gjlHyya765");
+        properties.put("metadata.password" , "{\"type\": \"mapString\",\"config\":{\"password\": \"8u7666gjlHyya765\"}}");
+
+        properties.put("broker.host" , ip);
+        properties.put("broker.port" ,"8082");;
+
+        HdfsConfiguration hadoopConf = new HdfsConfiguration();
+        hadoopConf.set("fs.default.name", "hdfs://druid-hadoop-demo:9000");
+        hadoopConf.set("fs.defaultFS", "hdfs://druid-hadoop-demo:9000");
+        hadoopConf.set("dfs.datanode.address", "druid-hadoop-demo");
+        hadoopConf.set("dfs.client.use.datanode.hostname", "true");
+
+        ByteArrayOutputStream bout = new ByteArrayOutputStream();
+        DataOutputStream dataOutputStream = new DataOutputStream(bout);
+        try {
+            hadoopConf.write(dataOutputStream);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        properties.put("deepStorageType".toLowerCase() , "hdfs");
+        properties.put("hdfs.hadoopConf".toLowerCase() , StringUtils.encodeBase64String(bout.toByteArray()));
+        try {
+            bout.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        properties.put("hdfs.storageDirectory".toLowerCase() , "hdfs://druid-hadoop-demo:9000/druid/segments/");
+
+
         int partitionId =  0;
-        StructType schema = null;
-        DruidDataWriterConfig config = null;
-        Configuration writerConf = conf
-                .dive(DruidConfigurationKeys.writerPrefix())
-                .merge(Configuration.fromKeyValue(DruidConfigurationKeys.tableKey(),
-                        conf.getString(DruidConfigurationKeys.tableKey())));
+        StructType schema = new StructType()
+                .add(DataTypes.createStructField("__time", DataTypes.TimestampType, true))
+                .add(DataTypes.createStructField("age", DataTypes.LongType, true))
+                .add(DataTypes.createStructField("address", DataTypes.StringType, true)
+                );
+
+        Configuration writerConf = new Configuration(JavaConverters.mapAsScalaMapConverter(properties).asScala().toMap(scala.Predef.<Tuple2<String,String>>conforms()));
+
 
 
         Option<scala.collection.immutable.Map<Object, scala.collection.immutable.Map<String, String>>> partitionIdToDruidPartitionsMap = writerConf
@@ -97,34 +158,35 @@ public class HdfsPushApp {
                     return null;
                 }
       );
-        String version = "";
         try {
+            NullHandlingUtils.initializeDruidNullHandling(true);
+            String dataSchemaStr = "{\"dataSource\":\"bb04\",\"timestampSpec\":{\"column\":\"__time\",\"format\":\"auto\",\"missingValue\":null},\"dimensionsSpec\":{\"dimensions\":[{\"type\":\"string\",\"name\":\"isRobot\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"channel\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"cityName\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isUnpatrolled\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"page\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"countryName\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"regionIsoCode\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"long\",\"name\":\"added\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":false},{\"type\":\"string\",\"name\":\"metroCode\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"comment\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isNew\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isMinor\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"long\",\"name\":\"delta\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":false},{\"type\":\"string\",\"name\":\"countryIsoCode\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isAnonymous\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"user\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"regionName\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"long\",\"name\":\"deleted\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":false},{\"type\":\"string\",\"name\":\"namespace\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true}],\"dimensionExclusions\":[\"__time\"]},\"metricsSpec\":[],\"granularitySpec\":{\"type\":\"uniform\",\"segmentGranularity\":{\"type\":\"all\"},\"queryGranularity\":{\"type\":\"none\"},\"rollup\":true,\"intervals\":[]},\"transformSpec\":{\"filter\":null,\"transforms\":[]}}";
+            try {
+                dataSchema = MAPPER.readValue(dataSchemaStr,DataSchema.class);
+            } catch (JsonProcessingException e) {
+                e.printStackTrace();
+            }
+
             config = new DruidDataWriterConfig(
-                    conf.getString(DruidConfigurationKeys.tableKey()),
+                    "bb04",
                     partitionId,
                     schema,
                     MAPPER.writeValueAsString(dataSchema),
-                    writerConf.get(DruidConfigurationKeys.shardSpecTypeDefaultKey()),
-                    writerConf.getInt(DruidConfigurationKeys.rowsPerPersistDefaultKey()),
-                    writerConf.get(DruidConfigurationKeys.deepStorageTypeDefaultKey()),
-                    conf,
-                    version,
+                    "numbered",//writerConf.get(DruidConfigurationKeysV1.shardSpecTypeDefaultKey()),
+                    2000000,//writerConf.getInt(DruidConfigurationKeysV1.rowsPerPersistDefaultKey()),
+                    "hdfs",//writerConf.get(DruidConfigurationKeysV1.deepStorageTypeDefaultKey()),
+                    writerConf,
+                    "1",//writerConf.get(DruidConfigurationKeysV1.versonDefaultKey()),
                     partitionIdToDruidPartitionsMap,
-                    writerConf.getBoolean(DruidConfigurationKeys.useCompactSketchesDefaultKey()),
-                    writerConf.getBoolean(DruidConfigurationKeys.useDefaultValueForNullDefaultKey())
+                    false,//writerConf.getBoolean(DruidConfigurationKeysV1.useCompactSketchesDefaultKey()),
+                    true//writerConf.getBoolean(DruidConfigurationKeysV1.useDefaultValueForNullDefaultKey())
             );
         } catch (JsonProcessingException e) {
             e.printStackTrace();
         }
 
 
-        NullHandlingUtils.initializeDruidNullHandling(config.useDefaultNullHandling());
-        String dataSchemaStr = "{\"dataSource\":\"bb04\",\"timestampSpec\":{\"column\":\"__time\",\"format\":\"auto\",\"missingValue\":null},\"dimensionsSpec\":{\"dimensions\":[{\"type\":\"string\",\"name\":\"isRobot\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"channel\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"cityName\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isUnpatrolled\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"page\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"countryName\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"regionIsoCode\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"long\",\"name\":\"added\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":false},{\"type\":\"string\",\"name\":\"metroCode\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"comment\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isNew\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isMinor\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"long\",\"name\":\"delta\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":false},{\"type\":\"string\",\"name\":\"countryIsoCode\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"isAnonymous\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"user\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"string\",\"name\":\"regionName\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true},{\"type\":\"long\",\"name\":\"deleted\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":false},{\"type\":\"string\",\"name\":\"namespace\",\"multiValueHandling\":\"SORTED_ARRAY\",\"createBitmapIndex\":true}],\"dimensionExclusions\":[\"__time\"]},\"metricsSpec\":[],\"granularitySpec\":{\"type\":\"uniform\",\"segmentGranularity\":{\"type\":\"all\"},\"queryGranularity\":{\"type\":\"none\"},\"rollup\":true,\"intervals\":[]},\"transformSpec\":{\"filter\":null,\"transforms\":[]}}";
-        try {
-            dataSchema = MAPPER.readValue(dataSchemaStr,DataSchema.class);
-        } catch (JsonProcessingException e) {
-            e.printStackTrace();
-        }
+
         closer = Closer.create();
         closer.register(new Closeable(){
             public void close(){
@@ -146,7 +208,7 @@ public class HdfsPushApp {
         indexSpecConf = config.properties().dive(DruidConfigurationKeys.indexSpecPrefix());
         indexSpec = new IndexSpec(
                 DruidDataWriter.getBitmapSerde(
-                        "",//indexSpecConf.get(DruidConfigurationKeys.bitmapTypeDefaultKey()),
+                        indexSpecConf.get(DruidConfigurationKeysV1.bitmapTypeDefaultKey()),
                         indexSpecConf.getBoolean(
                                 DruidConfigurationKeys.compressRunOnSerializationKey(),
                                 RoaringBitmapSerdeFactory.DEFAULT_COMPRESS_RUN_ON_SERIALIZATION)
@@ -173,7 +235,7 @@ public class HdfsPushApp {
 
         List<String> complexColumnTypes = Arrays.stream(dataSchema.getAggregators()).filter(a->a.getType() == ValueType.COMPLEX).map(a->a.getComplexTypeName()).collect(Collectors.toList());
 
-        DruidDataWriterConfig finalConfig = config;
+        final DruidDataWriterConfig finalConfig = config;
         complexColumnTypes.forEach(o->{
             ComplexMetricRegistry.registerByName(o, finalConfig.writeCompactSketches());
         });
@@ -185,18 +247,45 @@ public class HdfsPushApp {
 
 
 
-    public static void main(String[] args) throws IndexSizeExceededException {
-        Long timestamp = 0L;
-        dataSchema.getGranularitySpec().getSegmentGranularity().bucketStart(DateTimes.utc(timestamp)).getMillis();
-        IncrementalIndex index = null;
+    public static void main(String[] args) throws IOException {
+        Long timestamp = 1647175215000L;
+        long startMillis = dataSchema.getGranularitySpec().getSegmentGranularity().bucketStart(DateTimes.utc(timestamp)).getMillis();
+        IncrementalIndex index = createInterval(startMillis);
         List<String> dimensions = dataSchema.getDimensionsSpec().getDimensions().stream().map(o->o.getName()).collect(Collectors.toList());
         String tsColumn = dataSchema.getTimestampSpec().getTimestampColumn();
         int tsColumnIndex = config.schema().fieldIndex(tsColumn);
         Function<Object, DateTime>  timestampParser = TimestampParser.createObjectTimestampParser(dataSchema.getTimestampSpec().getTimestampFormat());
         Map<String,Integer> partitionMap = config.partitionMap().map(o-> ImmutableMap.of(config.partitionId()+"",config.partitionId())).getOrElse(()->ImmutableMap.of("partitionId",config.partitionId()));
-        Map<String, Object> event = null;
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("isRobot","true");
+        event.put("channel","1");
+        event.put("cityName","gz");
+        event.put("isUnpatrolled","2");
+        event.put("page","3");
+        event.put("countryName","china");
+        event.put("regionIsoCode","4");
+        event.put("added","5");
+        event.put("metroCode","6");
+        event.put("comment","7");
+        event.put("isNew","8");
+        event.put("delta","9");
+        event.put("countryIsoCode","10");
+        event.put("isAnonymous","11");
+        event.put("user","12");
+        event.put("deleted","13");
+        event.put("namespace","14");
         index.add(index.formatRow(new MapBasedInputRow(timestamp,dimensions,event)));
 
+        List<IndexableAdapter> indexableAdapters = new ArrayList<>();
+        indexableAdapters.add(flushIndex(index));
+
+        List<IncrementalIndex> indexList = new ArrayList<>();
+        indexList.add(index);
+
+
+        Tuple2<List<IndexableAdapter>, List<IncrementalIndex>> tuple2 = new Tuple2<>(indexableAdapters,indexList);
+        bucketToIndexMap.put(1L,tuple2);
+        commit();
     }
 
     private static IndexableAdapter flushIndex(IncrementalIndex index) throws IOException {
@@ -217,8 +306,6 @@ public class HdfsPushApp {
     }
 
     private static IncrementalIndex createInterval(Long startMillis) {
-        // Using OnHeapIncrementalIndex to minimize changes when migrating from IncrementalIndex. In the future, this should
-        // be optimized further. See https://github.com/apache/druid/issues/10321 for more information.
         return new OnheapIncrementalIndex.Builder()
                 .setIndexSchema(
                         new IncrementalIndexSchema.Builder()
@@ -239,7 +326,6 @@ public class HdfsPushApp {
 
 
     static WriterCommitMessage commit() throws IOException {
-        // Return segment locations on deep storage
         List<String> specs = bucketToIndexMap.values().stream().map(t->{
             List<IndexableAdapter> adapters = t._1;
             t._2.forEach(index-> {
@@ -252,8 +338,6 @@ public class HdfsPushApp {
             });
 
             if(!adapters.isEmpty()){
-                // TODO: Merge adapters up to a total number of rows, and then split into new segments.
-                //  The tricky piece will be determining the partition number for multiple segments (interpolate 0?)
                 IndexMergerV9 finalStaticIndexer = INDEX_MERGER_V9;
                 File file = null;
                 try {
@@ -263,7 +347,7 @@ public class HdfsPushApp {
                             dataSchema.getAggregators(),
                             tmpMergeDir,
                             indexSpec,
-                            -1 // TODO: Make maxColumnsToMerge configurable
+                            maxColumnsToMerge
                     );
                 } catch (IOException e) {
                     e.printStackTrace();
@@ -271,8 +355,10 @@ public class HdfsPushApp {
 
                 List<String> allDimensions = adapters.stream().map(a->a.getDimensionNames()).flatMap(ds->Stream.of(ds.toArray(new String[ds.size()]))).collect(Collectors.toList());
                 Interval interval = adapters.stream().map(a->a.getDataInterval()).reduce((l, r)-> Intervals.utc(Math.min(l.getStartMillis(), r.getStartMillis()),Math.max(l.getEndMillis(), r.getEndMillis()))).get();
-                scala.collection.immutable.Map<String, String> partitionMap = null;
-                ShardSpec shardSpec = ShardSpecRegistry.createShardSpec(config.shardSpec(), partitionMap);
+                scala.collection.immutable.Map<String, String> partitionMap = new scala.collection.immutable.HashMap<>();
+                //ShardSpec shardSpec = NoneShardSpec.instance();
+                ShardSpec shardSpec = null;
+                //ShardSpec shardSpec = ShardSpecRegistry.createShardSpec(config.shardSpec(), partitionMap);
                 DataSegment dataSegmentTemplate = new DataSegment(
                         config.dataSource(),
                         dataSchema.getGranularitySpec().getSegmentGranularity().bucket(DateTimes.utc(interval.getStartMillis())),
@@ -291,6 +377,7 @@ public class HdfsPushApp {
                     e.printStackTrace();
                 }
                 try {
+                    commit(ImmutableList.of(finalDataSegment));
                     return MAPPER.writeValueAsString(finalDataSegment);
                 } catch (JsonProcessingException e) {
                     e.printStackTrace();
@@ -306,4 +393,12 @@ public class HdfsPushApp {
         }
         return DruidWriterCommitMessage.apply(arrayBuffer);
     }
+
+
+    public static void  commit( List<DataSegment>segments){
+        DruidMetadataClient metadataClient = new DruidMetadataClient("mysql",ip,3306,"jdbc:mysql://"+ip+":3306/druid?allowPublicKeyRetrieval=true","druid","{\"type\": \"mapString\",\"config\":{\"password\": \"8u7666gjlHyya765\"}}",new Properties(),"druid");
+        metadataClient.publishSegments(segments);
+    }
+
+
 }

@@ -1,12 +1,8 @@
 package com.julianjaffe.spark_druid_connector;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.InjectableValues;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.jsontype.NamedType;
-import com.julianjaffe.spark_druid_connector.configuration.Configuration;
-import com.julianjaffe.spark_druid_connector.utils.DeepStorageConstructorHelpers;
 import com.julianjaffe.spark_druid_connector.v2.reader.DruidInputPartitionReader;
 import org.apache.druid.common.config.NullHandling;
 import org.apache.druid.data.input.InputRow;
@@ -34,7 +30,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 
-public class ReadHdfsApp {
+public class ReadHdfsApp1 {
     private final static ObjectMapper MAPPER = new DefaultObjectMapper();
 
 
